@@ -1,0 +1,37 @@
+name: fetch
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        required: true
+        type: string
+      mode:
+        description: 'head | download'
+        required: false
+        default: 'head'
+        type: string
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Fetch
+        run: |
+          code=$(curl -sSL --max-time 180 "${{ inputs.url }}" -o out.bin -w '%{http_code}')
+          echo "http=$code bytes=$(stat -c%s out.bin 2>/dev/null || echo 0)"
+          echo '--- matches ---'
+          grep -aoiE '[^",]{0,60}(sqc100|sta100|classic|3216|autoloader)[^",]{0,60}' out.bin | head -60 || true
+      - name: Pack
+        if: ${{ inputs.mode == 'download' }}
+        run: |
+          mkdir -p out && mv out.bin out/ && cd out
+          f=$(ls -S | head -1); echo "FILE=$f SIZE=$(stat -c%s "$f")"
+          split -b 1800m -d -a 2 "$f" part_
+          sha256sum part_* > SHA256SUMS.txt; rm -f "$f"; ls -l
+      - uses: actions/upload-artifact@v4
+        if: ${{ inputs.mode == 'download' }}
+        with:
+          name: fetched
+          path: out/*
+          compression-level: 0
+          retention-days: 2
