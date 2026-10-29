@@ -1,0 +1,51 @@
+name: relay
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'source URL (mega link)'
+        required: true
+        type: string
+      mode:
+        description: 'probe | download'
+        required: false
+        default: 'probe'
+        type: string
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Install
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq megatools p7zip-full curl
+      - name: Probe
+        if: ${{ inputs.mode == 'probe' }}
+        run: |
+          echo "url=${{ inputs.url }}"
+          timeout 30 megadl --path . --no-progress "${{ inputs.url }}" || echo "(stopped after probe)"
+          ls -l
+      - name: Download
+        if: ${{ inputs.mode == 'download' }}
+        run: |
+          mkdir -p out
+          megadl --path out --no-progress "${{ inputs.url }}"
+          ls -l out
+          sha256sum out/* | tee out/SHA256SUMS.txt
+      - name: Split
+        if: ${{ inputs.mode == 'download' }}
+        run: |
+          cd out
+          f=$(ls -S | grep -v SHA256SUMS | head -1); echo "FILE=$f"
+          sz=$(stat -c%s "$f"); echo "SIZE=$sz"
+          split -b 1800m -d -a 2 "$f" "part_"
+          rm -f "$f"
+          ls -l
+      - uses: actions/upload-artifact@v4
+        if: ${{ inputs.mode == 'download' }}
+        with:
+          name: bb10-parts
+          path: out/*
+          compression-level: 0
+          retention-days: 2
