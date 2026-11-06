@@ -1,0 +1,117 @@
+name: apk2
+run-name: apk2 ${{ inputs.pkg }}
+on:
+  workflow_dispatch:
+    inputs:
+      pkg:
+        description: 'package id'
+        required: true
+        default: 'com.pas.webcam'
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      WORK: /tmp/apkwork
+      PKG: ${{ inputs.pkg }}
+    steps:
+      - name: Tooling + shared workspace
+        run: |
+          sudo apt-get -qq update >/dev/null 2>&1 || true
+          sudo apt-get -qq install -y apksigner openjdk-17-jre-headless unzip >/dev/null 2>&1 || echo "apt apksigner unavailable"
+          echo "apksigner: $(command -v apksigner || echo MISSING)"
+          rm -rf "$WORK"; mkdir -p "$WORK/cand"; ln -sfn "$WORK/cand" cand
+          echo "cand -> $(readlink -f cand)"
+
+      - name: Source C (PRIMARY) - F-Droid (repo does not bot-block datacenter IPs)
+        run: |
+          echo "--- F-Droid API ---"
+          api=$(curl -sS --max-time 60 "https://f-droid.org/api/v1/packages/$PKG" 2>/dev/null || echo "")
+          echo "api_head: $(printf '%s' "$api" | head -c 240)"
+          names=$(printf '%s' "$api" | python3 -c '
+import sys,json
+try:
+    d=json.load(sys.stdin)
+    print("\n".join(a["name"] for a in d.get("apks",[])))
+except Exception as e:
+    print("",end="")
+' 2>/dev/null)
+          if [ -z "$names" ]; then echo "C: F-Droid returned no APK names (pkg may be absent from main repo)"; fi
+          printf '%s\n' "$names" | while IFS= read -r nm; do
+            [ -n "$nm" ] || continue
+            code=$(curl -sSL --max-time 180 "https://f-droid.org/repo/$nm" -o "cand/_tmp" -w '%{http_code}' 2>/dev/null || echo ERR)
+            sz=$(stat -c%s "cand/_tmp" 2>/dev/null || echo 0)
+            magic=$(head -c2 "cand/_tmp" 2>/dev/null | od -An -tx1 | tr -d ' \n')
+            echo "C: $nm http=$code bytes=$sz magic=$magic"
+            if [ "$magic" = "504b" ]; then mv "cand/_tmp" "cand/C-$nm"; else rm -f "cand/_tmp"; fi
+          done
+          ls -l cand/ || true
+
+      - name: Source B (SECOND) - apkpure direct, for cert cross-check
+        run: |
+          UA='Mozilla/5.0 (Linux; Android 12; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36'
+          for u in \
+            "https://d.apkpure.com/b/APK/$PKG?version=latest" \
+            "https://b6.apkpure.com/b/APK/$PKG?version=latest" ; do
+            code=$(curl -sSL -A "$UA" --max-time 120 "$u" -o "cand/_B.bin" -w '%{http_code}' 2>/dev/null || echo ERR)
+            sz=$(stat -c%s "cand/_B.bin" 2>/dev/null || echo 0)
+            magic=$(head -c2 "cand/_B.bin" 2>/dev/null | od -An -tx1 | tr -d ' \n')
+            echo "B http=$code bytes=$sz magic=$magic url=$u"
+            if [ "$magic" = "504b" ]; then mv "cand/_B.bin" "cand/B-$(echo "$u" | md5sum | cut -c1-8).apk"; else rm -f "cand/_B.bin"; fi
+          done
+          ls -l cand/ || true
+
+      - name: Verify + fingerprint every candidate + cross-check certs
+        run: |
+          : > "$WORK/REPORT.txt"
+          declare -A CERTS
+          cd cand || exit 0
+          for f in *.apk C-*.apk; do
+            [ -e "$f" ] || continue
+            {
+              echo "=== FILE $f bytes=$(stat -c%s "$f")"
+              echo "sha256=$(sha256sum "$f" | cut -d' ' -f1)"
+              echo "required_entries=$(unzip -l "$f" 2>/dev/null | grep -cE 'AndroidManifest|classes')"
+              if command -v apksigner >/dev/null 2>&1; then
+                apksigner verify --print-certs "$f" 2>&1 | grep -iE "certificate (SHA-256|SHA-1|DN)" | sed 's/^/apksigner: /'
+              fi
+            } >> "$WORK/REPORT.txt"
+            c=$(apksigner verify --print-certs "$f" 2>/dev/null | grep -m1 -iE "SHA-256 fingerprint" | grep -oE '[0-9a-fA-F:]{64,96}')
+            echo "$f  cert=$c" >> "$WORK/CERTLIST"
+          done
+          {
+            echo "=== CROSS-CHECK ==="
+            if [ -s "$WORK/CERTLIST" ]; then
+              sort -u -t= -k2,2 "$WORK/CERTLIST" >/dev/null 2>&1
+              nuniq=$(cut -d= -f2 "$WORK/CERTLIST" | sort -u | grep -c .)
+              echo "distinct_certs=$nuniq"
+              cat "$WORK/CERTLIST"
+              [ "$nuniq" = "1" ] && echo "RESULT=SIGNATURES_MATCH" || echo "RESULT=SIGNATURES_DIFFER (do NOT install)"
+            fi
+          } >> "$WORK/REPORT.txt"
+          [ -s "$WORK/REPORT.txt" ] || echo "NO_VALID_APK_CANDIDATE" > "$WORK/REPORT.txt"
+          cat "$WORK/REPORT.txt"
+
+      - name: Publish to Release
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG=apk-latest
+          gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
+          ls -l cand/ 2>/dev/null || true
+          if ls cand/*.apk cand/C-*.apk >/dev/null 2>&1; then
+            gh release create "$TAG" cand/*.apk cand/C-*.apk "$WORK/REPORT.txt" \
+              --title "apk2 $PKG ($(date -u '+%Y-%m-%d %H:%M UTC'))" \
+              --notes-file "$WORK/REPORT.txt"
+          else
+            gh release create "$TAG" "$WORK/REPORT.txt" \
+              --title "apk2 $PKG FAILED ($(date -u '+%Y-%m-%d %H:%M UTC'))" \
+              --notes-file "$WORK/REPORT.txt"
+          fi
+          gh release view "$TAG" --json tagName,assets --jq '.tagName, (.assets[].name)'
