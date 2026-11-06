@@ -1,0 +1,98 @@
+name: apk
+run-name: apk ${{ inputs.pkg }}
+on:
+  workflow_dispatch:
+    inputs:
+      pkg:
+        description: 'package id'
+        required: true
+        default: 'com.pas.webcam'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      WORK: /tmp/apkwork
+    steps:
+      - name: Tooling + shared workspace
+        run: |
+          sudo apt-get -qq update >/dev/null 2>&1 || true
+          sudo apt-get -qq install -y apksigner openjdk-17-jre-headless unzip >/dev/null 2>&1 || echo "apt apksigner unavailable"
+          python3 -m pip install --quiet dapkeep 2>&1 | tail -2 || echo "pip dapkeep failed"
+          echo "apkeep: $(command -v apkeep || echo MISSING)"
+          echo "sksr: $(command -v sksr || echo MISSING)"
+          echo "apksigner: $(command -v apksigner || echo MISSING)"
+          rm -rf "$WORK"; mkdir -p "$WORK/cand"; ln -sfn "$WORK/cand" cand
+          echo "cand -> $(readlink -f cand)"
+
+      - name: Source A - Google Play via apkeep (official googleapis CDN)
+        run: |
+          if command -v apkeep >/dev/null 2>&1; then
+            timeout 180 apkeep -t apkeep -a "${{ inputs.pkg }}" cand/A-play.apk 2>&1 | tail -8 || echo "A: apkeep delivery failed (needs googleapis auth)"
+          else
+            echo "A: apkeep MISSING"
+          fi
+          ls -l cand/ || true
+
+      - name: Source B - third-party mirrors (overseas)
+        run: |
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36'
+          i=0
+          for u in \
+            "https://d.apkpure.com/b/APK/${{ inputs.pkg }}?version=latest" \
+            "https://home.f0f.droidapcheaps3.com/public/0/${{ inputs.pkg }}" \
+            "https://apkpure.com/ip-webcam/${{ inputs.pkg }}" ; do
+            i=$((i+1))
+            code=$(curl -sSL -A "$UA" --max-time 120 "$u" -o "cand/B$i.bin" -w '%{http_code}' 2>/dev/null || echo ERR)
+            sz=$(stat -c%s "cand/B$i.bin" 2>/dev/null || echo 0)
+            magic=$(head -c2 "cand/B$i.bin" 2>/dev/null | od -An -tx1 | tr -d ' \n')
+            echo "B$i http=$code bytes=$sz magic=$magic url=$u"
+            if [ "$magic" = "504b" ]; then mv "cand/B$i.bin" "cand/B$i.apk"; else rm -f "cand/B$i.bin"; fi
+          done
+          ls -l cand/ || true
+
+      - name: Verify + fingerprint every candidate
+        run: |
+          : > "$WORK/REPORT.txt"
+          cd cand || exit 0
+          for f in *.apk; do
+            [ -e "$f" ] || continue
+            {
+              echo "=== FILE $f bytes=$(stat -c%s "$f")"
+              echo "sha256=$(sha256sum "$f" | cut -d' ' -f1)"
+              echo "required_entries=$(unzip -l "$f" 2>/dev/null | grep -cE 'AndroidManifest|classes')"
+              if command -v apksigner >/dev/null 2>&1; then
+                apksigner verify --print-certs "$f" 2>&1 | grep -iE "certificate (SHA-256|SHA-1|DN)|Verified using" | sed 's/^/apksigner: /' || echo "apksigner: verify error"
+              else
+                echo "apksigner: MISSING"
+              fi
+              unzip -l "$f" 2>/dev/null | grep -oE "[A-Za-z0-9_.-]+\.(RSA|DSA|EC)" | head -3 | sed 's/^/sigfile: /'
+              echo
+            } >> "$WORK/REPORT.txt"
+          done
+          [ -s "$WORK/REPORT.txt" ] || echo "NO_VALID_APK_CANDIDATE" > "$WORK/REPORT.txt"
+          cat "$WORK/REPORT.txt"
+
+      - name: Publish to Release
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG=apk-latest
+          gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
+          ls -l cand/ 2>/dev/null || true
+          if ls cand/*.apk >/dev/null 2>&1; then
+            gh release create "$TAG" cand/*.apk "$WORK/REPORT.txt" \
+              --title "apk ${{ inputs.pkg }} ($(date -u '+%Y-%m-%d %H:%M UTC'))" \
+              --notes-file "$WORK/REPORT.txt"
+          else
+            gh release create "$TAG" "$WORK/REPORT.txt" \
+              --title "apk ${{ inputs.pkg }} FAILED ($(date -u '+%Y-%m-%d %H:%M UTC'))" \
+              --notes-file "$WORK/REPORT.txt"
+          fi
